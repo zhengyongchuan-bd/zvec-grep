@@ -188,6 +188,104 @@ test("limit-based weighting skips tail candidates without changing results", asy
   assert.equal(limited.hits[0].score, full.hits[0].score);
 });
 
+test("skips scoring candidates that cannot reach the visible window", async () => {
+  // The three-entity fixture keeps every candidate within reach of the cutoff,
+  // so it never exercises the skip itself. Build a deep tail instead, and make
+  // symbolType observable to prove the tail is not merely ranked low but never
+  // scored at all.
+  const TAIL = 200;
+  const files = [];
+  const entities = [];
+  const scored = new Set();
+
+  for (let index = 0; index < TAIL; index++) {
+    const id = `entity-${String(index).padStart(3, "0")}`;
+    files.push(file(`file-${index}`, `src/f${index}.ts`, 100));
+
+    const base = entity(id, `file-${index}`, `Symbol${index}`);
+    // Reading symbolType is the first thing scoring does with code metadata.
+    entities.push({
+      ...base,
+      metadata: Object.defineProperty({ ...base.metadata }, "symbolType", {
+        get() {
+          scored.add(id);
+          return "function";
+        },
+        enumerable: true,
+      }),
+    });
+  }
+
+  const fileOf = (item) =>
+    files.find((candidate) => candidate.id === item.fileId);
+  const ranked = (path) =>
+    entities.map((item, index) => ({
+      fragment: fragment(item),
+      file: fileOf(item),
+      path,
+      score: 1 - index * 0.001,
+    }));
+
+  const storage = {
+    getFileById: (id) => files.find((item) => item.id === id) ?? null,
+    getFileByPath: (path) =>
+      files.find((item) => item.absolutePath === path) ?? null,
+    listFiles: () => files,
+    listEntitiesByFile: () => [],
+    getEntity: (id) => {
+      const found = entities.find((item) => item.id === id);
+      if (!found) return null;
+      return { entity: found, file: fileOf(found), vector: [1, 0] };
+    },
+    upsertFile: () => {},
+    markFileFailed: () => {},
+    deleteFile: () => {},
+    searchFts: (_query, limit) => ranked("fts").slice(0, limit),
+    searchVector: (_vector, limit) => ranked("vector").slice(0, limit),
+    optimize: () => {},
+    close: () => {},
+  };
+
+  const context = {
+    workspaceIndex: {
+      id: "workspace-index-1",
+      name: "docs",
+      path: "/tmp/index",
+      rootPaths: [{ absolutePath: "/repo", recursive: true }],
+      createdTime: 1,
+      updatedTime: 1,
+    },
+    storage,
+    embeddingModel: new FakeEmbeddingModel(),
+  };
+
+  const routes = [
+    { mode: "fts", query: "Symbol" },
+    { mode: "vector", query: "Symbol" },
+  ];
+
+  const limited = await searchWorkspaceIndex({ routes, limit: 5 }, context);
+  assert.equal(limited.hits.length, 5);
+
+  const deepTail = `entity-${String(TAIL - 1).padStart(3, "0")}`;
+  assert.ok(
+    !scored.has(deepTail),
+    `${deepTail} cannot reach the window and should never be scored`,
+  );
+  assert.ok(
+    scored.size < TAIL,
+    `pruning should skip the tail, but all ${TAIL} candidates were scored`,
+  );
+
+  // The window itself must still match a full, unpruned scoring pass.
+  scored.clear();
+  const full = await searchWorkspaceIndex({ routes, limit: TAIL }, context);
+  assert.deepEqual(
+    limited.hits.map((hit) => hit.entity.id),
+    full.hits.slice(0, 5).map((hit) => hit.entity.id),
+  );
+});
+
 test("tracking an entity still reports a weighted score for it", async () => {
   const { context } = createFixture();
 

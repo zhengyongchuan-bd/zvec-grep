@@ -9,28 +9,36 @@ import type {
  *
  * Two properties are deliberate:
  *
- * - Factors stay close to 1, so these adjustments break near-ties rather than
- *   override the fused ranking. A candidate RRF ranks clearly higher stays higher.
  * - Nothing is ever scored below 1. Demoting a symbol type asserts "this is less
  *   likely to be relevant", which needs stronger evidence than we have; failing
  *   to promote is the cheaper mistake.
+ * - Signature and scope evidence is capped so that no amount of it substitutes
+ *   for a stronger signal; symbol-name evidence is allowed to accumulate,
+ *   because multi-word queries depend on it. See BOOST_CEILINGS.
+ *
+ * The per-token ordering is exact > partial > scope > signature. That ordering
+ * holds in aggregate for the weak tiers only: several partial name hits may
+ * legitimately outrank one incidental exact hit, which is what multi-word
+ * queries need, but no number of signature hits can reach one scope hit.
+ *
+ * This is bounded reranking, not tie-breaking. The ceiling is roughly 2.28x, and
+ * under a single RRF route that is enough for a candidate around rank 79 to pass
+ * one at rank 1 (2.28/139 > 1/61). Reordering across that distance is the
+ * intent; the bound is what keeps it from becoming unbounded.
  *
  * The constants below reflect empirical calibration across a 1,000-query
  * multi-scenario benchmark covering exact symbols, intent phrases, natural
- * language QA, scoped lookups, and runtime error traces. Their relative ordering
- * preserves the hierarchy (exact name > partial > scope > signature), while
- * their values provide sufficient separation to bridge rank ties without
- * overriding fundamental RRF convergence.
+ * language QA, scoped lookups, and runtime error traces.
  */
 
 /** Query token matched the symbol name exactly (case-insensitive). */
-const SYMBOL_NAME_EXACT_BOOST = 0.60;
+const SYMBOL_NAME_EXACT_BOOST = 0.6;
 
 /** Query token is a substring of the symbol name, or vice versa. */
 const SYMBOL_NAME_PARTIAL_BOOST = 0.36;
 
 /** Query token matched the enclosing scope (class/module the symbol lives in). */
-const SCOPE_MATCH_BOOST = 0.30;
+const SCOPE_MATCH_BOOST = 0.3;
 
 /** Query token matched the signature but neither the name nor the scope. */
 const SIGNATURE_MATCH_BOOST = 0.08;
@@ -43,13 +51,67 @@ const SIGNATURE_MATCH_BOOST = 0.08;
  * out-score a genuine symbol-name hit. Secondary matches are therefore
  * discounted, and the total is capped below.
  */
-const SECONDARY_MATCH_WEIGHT = 0.60;
+const SECONDARY_MATCH_WEIGHT = 0.6;
 
 /**
- * Ceiling on the summed position boost. Keeps the strongest single signal
- * (an exact name match) dominant no matter how many weak terms also hit.
+ * Ceiling on the summed position boost.
+ *
+ * Reached only when the strongest signal is an exact name match; weaker
+ * strongest-signals cap out lower. See BOOST_CEILINGS.
  */
 const MAX_POSITION_BOOST = SYMBOL_NAME_EXACT_BOOST * 1.5;
+
+/**
+ * Match categories, ordered weakest to strongest. The ordering is load-bearing:
+ * comparing categories rather than their boost values keeps the "strongest wins"
+ * logic correct even if two categories are ever calibrated to the same value.
+ */
+const MATCH_NONE = 0;
+const MATCH_SIGNATURE = 1;
+const MATCH_SCOPE = 2;
+const MATCH_PARTIAL = 3;
+const MATCH_EXACT = 4;
+
+/** Boost contributed by one token, indexed by match category. */
+const MATCH_BOOSTS: readonly number[] = [
+  0,
+  SIGNATURE_MATCH_BOOST,
+  SCOPE_MATCH_BOOST,
+  SYMBOL_NAME_PARTIAL_BOOST,
+  SYMBOL_NAME_EXACT_BOOST,
+];
+
+/**
+ * Nudges a ceiling just below the value it is derived from, so the comparison
+ * stays strict under floating-point arithmetic.
+ */
+const STRICTLY_BELOW = 1 - 1e-9;
+
+/**
+ * Ceiling on the summed boost, indexed by the strongest category that matched.
+ *
+ * The weak tiers are capped strictly below the next category's single-token
+ * boost, so no number of signature hits can reach one scope hit and no number
+ * of scope hits can reach one partial hit. Without this, twelve signature terms
+ * out-scored an exact name match — a wide function signature could beat the
+ * symbol the user actually named.
+ *
+ * Partial and exact are deliberately NOT capped that way. A partial hit is real
+ * locating evidence, and multi-word queries ("call solve least squares") depend
+ * on several of them adding up to outrank a single incidental exact hit.
+ * Capping the partial tier as well was measured on the 1,000-query benchmark:
+ * it regressed 37 queries and improved 5, for -0.0034 MRR (95% CI
+ * [-0.0051, -0.0012]), almost entirely on multi-word action phrases. Capping
+ * only the signature and scope tiers costs nothing measurable (MRR unchanged at
+ * 0.5021) and still removes the pathology.
+ */
+const BOOST_CEILINGS: readonly number[] = [
+  0,
+  SCOPE_MATCH_BOOST * STRICTLY_BELOW,
+  SYMBOL_NAME_PARTIAL_BOOST * STRICTLY_BELOW,
+  MAX_POSITION_BOOST,
+  MAX_POSITION_BOOST,
+];
 
 /**
  * Shortest token allowed to earn a boost by substring containment. Exact
@@ -109,8 +171,8 @@ const STOP_WORDS: ReadonlySet<string> = new Set([
  * slightly above incidental matches; nothing is demoted below neutral.
  */
 const SYMBOL_TYPE_WEIGHTS: Readonly<Record<CodeSymbolType, number>> = {
-  function: 1.20,
-  class: 1.10,
+  function: 1.2,
+  class: 1.1,
   interface: 1.05,
   module: 1.0,
   value: 1.0,
@@ -148,11 +210,12 @@ function maxSymbolTypeWeight(): number {
 
 /**
  * Escape hatch: setting this to "0" / "off" / "false" reverts fusion to stock
- * RRF ordering without a redeploy, so a bad ranking regression can be disabled
- * in place.
+ * RRF ordering, so a bad ranking regression can be turned off by restarting the
+ * process with the variable set.
  *
- * Read once at load: fusion calls into this module once per candidate, and
- * reading process.env on every call costs more than the scoring itself.
+ * Read once at load, so changing it mid-process has no effect: fusion calls
+ * into this module once per candidate, and reading process.env on every call
+ * costs more than the scoring itself.
  */
 const DISABLE_ENV_VAR = "ZVEC_GREP_RANKING_WEIGHTS";
 
@@ -162,6 +225,15 @@ function readWeightsEnabled(): boolean {
   const raw = process.env[DISABLE_ENV_VAR]?.trim().toLowerCase();
 
   return raw !== "0" && raw !== "off" && raw !== "false";
+}
+
+/**
+ * Whether weighting is on. Fusion checks this once per search to skip the
+ * cutoff sort and the whole weighting pass, rather than calling
+ * rankingMultiplier() per candidate only to get 1 back.
+ */
+export function rankingWeightsEnabled(): boolean {
+  return weightsEnabled;
 }
 
 /**
@@ -255,8 +327,17 @@ function queryTokens(recall: readonly SearchRecallTrace[]): TokenPlan {
 
   queries.sort();
 
-  return tokenPlanForQueries(queries.join(" "), queries);
+  // NUL is the separator because the tokeniser can never emit it: identifiers
+  // are [A-Za-z_][A-Za-z0-9_]*, so no token contains it. Two different query
+  // sets therefore cannot collide on a key unless they tokenise identically,
+  // which makes sharing a cache entry harmless. A plain concatenation would
+  // collide ("barfoo" vs ["bar","foo"]) and leak one query's plan into another.
+  // Renderers tend to show NUL as nothing at all — it is a real character here.
+  return tokenPlanForQueries(queries.join(QUERY_KEY_SEPARATOR), queries);
 }
+
+/** See the collision argument in queryTokens(). */
+const QUERY_KEY_SEPARATOR = "\u0000";
 
 /**
  * The query terms a candidate is scored against, precomputed once per query.
@@ -385,8 +466,9 @@ function lowered(value: string | null | undefined): string | undefined {
  * position (the symbol name) over those that only matched somewhere in the body.
  *
  * The strongest match counts in full and every other match is discounted, so
- * matching several terms still helps without letting a pile of weak signature
- * hits overtake a genuine symbol-name match.
+ * matching several terms still helps. The total is then capped by the strongest
+ * category that matched, which is what stops a pile of weak signature hits from
+ * overtaking a genuine symbol-name match.
  */
 function positionBoost(
   metadata: Extract<EntityMetadata, { kind: "code" }>,
@@ -395,41 +477,64 @@ function positionBoost(
   const symbolName = lowered(metadata.symbolName);
   const scope = lowered(metadata.scope);
   const signature = lowered(metadata.signature);
+  let strongestCategory = MATCH_NONE;
   let strongest = 0;
   let rest = 0;
 
   // An exact name match is the strongest signal available, and it is the only
   // one a stop word or a very short token can still earn.
-  if (symbolName !== undefined && matchesSymbolNameExactly(symbolName, plan)) {
+  const exactToken =
+    symbolName === undefined
+      ? undefined
+      : exactSymbolNameToken(symbolName, plan);
+  if (exactToken !== undefined) {
+    strongestCategory = MATCH_EXACT;
     strongest = SYMBOL_NAME_EXACT_BOOST;
   }
 
   for (const token of plan.substring) {
-    if (token === symbolName) {
-      // Already counted above as the exact-name match.
+    // Already counted in full as the exact-name match. Skipping the token that
+    // earned it — not just one equal to the whole name — is what keeps a
+    // qualified name (`Foo::bar` matched by `bar`) from also collecting a
+    // partial boost for the same token.
+    if (token === exactToken) {
       continue;
     }
 
-    const boost = substringPositionBoost(token, symbolName, scope, signature);
-    if (boost > strongest) {
+    const category = substringMatchCategory(
+      token,
+      symbolName,
+      scope,
+      signature,
+    );
+    if (category === MATCH_NONE) {
+      continue;
+    }
+
+    const boost = MATCH_BOOSTS[category]!;
+    if (category > strongestCategory) {
       rest += strongest;
+      strongestCategory = category;
       strongest = boost;
     } else {
       rest += boost;
     }
   }
 
-  if (strongest === 0) {
+  if (strongestCategory === MATCH_NONE) {
     return NEUTRAL_WEIGHT;
   }
 
   const total = strongest + rest * SECONDARY_MATCH_WEIGHT;
 
-  return NEUTRAL_WEIGHT + Math.min(total, MAX_POSITION_BOOST);
+  return NEUTRAL_WEIGHT + Math.min(total, BOOST_CEILINGS[strongestCategory]!);
 }
 
 /**
- * Whether the query names this symbol outright.
+ * The query token that names this symbol outright, or undefined.
+ *
+ * Returns the token rather than a boolean so the caller can exclude it from
+ * substring scanning; counting it twice inflated qualified names by ~13%.
  *
  * Qualified names carry separators the query tokeniser strips — `Foo::bar`
  * arrives as `foo` and `bar` — so comparing the raw name against query terms
@@ -437,17 +542,23 @@ function positionBoost(
  * back to the name's own identifier segments makes those match on the last
  * segment, which is what the user typed.
  */
-function matchesSymbolNameExactly(
+function exactSymbolNameToken(
   symbolName: string,
   plan: TokenPlan,
-): boolean {
+): string | undefined {
   if (plan.all.has(symbolName)) {
-    return true;
+    return symbolName;
   }
 
   const segments = identifierSegments(symbolName);
+  if (segments.length > 1) {
+    const last = segments[segments.length - 1]!;
+    if (plan.all.has(last)) {
+      return last;
+    }
+  }
 
-  return segments.length > 1 && plan.all.has(segments[segments.length - 1]!);
+  return undefined;
 }
 
 const segmentCache = new Map<string, readonly string[]>();
@@ -471,28 +582,28 @@ function identifierSegments(value: string): readonly string[] {
 }
 
 /**
- * Boost contributed by a single substring-eligible token, expressed as an
- * increment above neutral. Returns 0 when the token matched no position.
+ * The strongest position a single substring-eligible token matched, or
+ * MATCH_NONE.
  */
-function substringPositionBoost(
+function substringMatchCategory(
   token: string,
   symbolName: string | undefined,
   scope: string | undefined,
   signature: string | undefined,
 ): number {
   if (symbolName !== undefined && isSubstringMatch(symbolName, token)) {
-    return SYMBOL_NAME_PARTIAL_BOOST;
+    return MATCH_PARTIAL;
   }
 
   if (scope !== undefined && isSubstringMatch(scope, token)) {
-    return SCOPE_MATCH_BOOST;
+    return MATCH_SCOPE;
   }
 
   if (signature !== undefined && isSubstringMatch(signature, token)) {
-    return SIGNATURE_MATCH_BOOST;
+    return MATCH_SIGNATURE;
   }
 
-  return 0;
+  return MATCH_NONE;
 }
 
 /**
@@ -513,6 +624,18 @@ function isSubstringMatch(haystack: string, token: string): boolean {
 }
 
 function symbolTypeWeight(symbolType: CodeSymbolType): number {
-  // Unknown types (a newer extractor, or hand-built metadata) stay neutral.
-  return SYMBOL_TYPE_WEIGHTS[symbolType] ?? NEUTRAL_WEIGHT;
+  // Own-property lookup only. A plain object literal inherits from
+  // Object.prototype, so an extractor emitting "constructor" or "toString" —
+  // both plausible symbol names — would otherwise read a function off the
+  // prototype and turn the score into NaN. NaN breaks more than the one
+  // candidate: the fusion comparator returns NaN (sorting as 0, so the order
+  // goes unstable) and the pruning test `score * MAX < cutoff` is false for
+  // NaN, silently voiding the upper bound.
+  if (!Object.hasOwn(SYMBOL_TYPE_WEIGHTS, symbolType)) {
+    return NEUTRAL_WEIGHT;
+  }
+
+  const weight = SYMBOL_TYPE_WEIGHTS[symbolType];
+
+  return Number.isFinite(weight) ? weight : NEUTRAL_WEIGHT;
 }

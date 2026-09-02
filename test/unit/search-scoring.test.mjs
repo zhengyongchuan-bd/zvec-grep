@@ -183,21 +183,17 @@ test("keeps the total adjustment within a narrow band", () => {
     recall: recall("load load load load load load load load"),
   });
 
-  assert.ok(multiplier <= (1 + 0.6 * 1.5) * 1.2, `${multiplier} should stay bounded`);
+  assert.ok(
+    multiplier <= (1 + 0.6 * 1.5) * 1.2,
+    `${multiplier} should stay bounded`,
+  );
 });
 
 test("weak signature hits never outrank an exact symbol name match", () => {
   // Compounding one factor per token used to let a wide signature accumulate
-  // past the strongest available signal.
-  const manySignatureHits = rankingMultiplier({
-    metadata: codeMetadata({
-      symbolName: "X",
-      scope: null,
-      signature:
-        "func X(alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa int) error",
-    }),
-    recall: recall("alpha beta gamma delta epsilon zeta eta theta iota kappa"),
-  });
+  // past the strongest available signal. Ten tokens happened to stay under the
+  // exact boost by luck; twelve did not, so sweep well past the crossover and
+  // up to the token-scan cap.
   const exactName = rankingMultiplier({
     metadata: codeMetadata({
       symbolName: "alpha",
@@ -207,10 +203,92 @@ test("weak signature hits never outrank an exact symbol name match", () => {
     recall: recall("alpha"),
   });
 
+  for (const count of [10, 12, 16, 32, 64]) {
+    const tokens = Array.from({ length: count }, (_, i) => `uniqtok${i}`);
+    const manySignatureHits = rankingMultiplier({
+      metadata: codeMetadata({
+        symbolName: "X",
+        scope: null,
+        signature: `func X(${tokens.join(", ")} int) error`,
+      }),
+      recall: recall(tokens.join(" ")),
+    });
+
+    assert.ok(
+      exactName > manySignatureHits,
+      `exact name ${exactName} should beat ${count} signature hits (${manySignatureHits})`,
+    );
+  }
+});
+
+test("weak evidence never substitutes for a stronger signal", () => {
+  // Signature and scope are capped below the next category's single-token
+  // boost, so no amount of either stands in for a stronger hit. Symbol-name
+  // evidence is deliberately exempt: see the partial-stacking test below.
+  // A neutral symbol type keeps this about position boosts alone.
+  const base = { symbolType: "module", scope: null, signature: null };
+  const oneScope = rankingMultiplier({
+    metadata: codeMetadata({ ...base, symbolName: "zzz", scope: "alphaa" }),
+    recall: recall("alphaa"),
+  });
+  const onePartial = rankingMultiplier({
+    metadata: codeMetadata({ ...base, symbolName: "alphaaxtail" }),
+    recall: recall("alphaax"),
+  });
+
+  for (let count = 1; count <= 40; count++) {
+    const tokens = Array.from({ length: count }, (_, i) => `uniqtok${i}`);
+    const query = recall(tokens.join(" "));
+
+    const signatureOnly = rankingMultiplier({
+      metadata: codeMetadata({
+        ...base,
+        symbolName: "zzz",
+        signature: `f(${tokens.join(", ")})`,
+      }),
+      recall: query,
+    });
+    const scopeOnly = rankingMultiplier({
+      metadata: codeMetadata({
+        ...base,
+        symbolName: "zzz",
+        scope: tokens.join(" "),
+      }),
+      recall: query,
+    });
+
+    assert.ok(
+      signatureOnly < oneScope,
+      `${count} signature hits (${signatureOnly}) should stay under one scope hit (${oneScope})`,
+    );
+    assert.ok(
+      scopeOnly < onePartial,
+      `${count} scope hits (${scopeOnly}) should stay under one partial hit (${onePartial})`,
+    );
+  }
+});
+
+test("lets several symbol-name hits outweigh one incidental exact hit", () => {
+  // Deliberate, and the opposite of the rule for signature and scope: a
+  // multi-word query ("call solve least squares") locates a symbol through
+  // several partial name hits, and capping them below one exact hit regressed
+  // 37 of the 1,000 benchmark queries while improving 5.
+  const base = { symbolType: "module", scope: null, signature: null };
+  const oneExact = rankingMultiplier({
+    metadata: codeMetadata({ ...base, symbolName: "alphaa" }),
+    recall: recall("alphaa"),
+  });
+  const manyPartial = rankingMultiplier({
+    metadata: codeMetadata({ ...base, symbolName: "solveleastsquarestail" }),
+    recall: recall("solve least squares"),
+  });
+
   assert.ok(
-    exactName > manySignatureHits,
-    `exact name ${exactName} should beat ${manySignatureHits}`,
+    manyPartial > oneExact,
+    `three partial hits (${manyPartial}) should be able to pass one exact hit (${oneExact})`,
   );
+  // Still bounded, and still below what an exact hit plus the same evidence earns.
+  assert.ok(manyPartial <= MAX_RANKING_MULTIPLIER);
 });
 
 test("counts additional matches, at a discount", () => {
@@ -379,12 +457,139 @@ test("matches qualified symbol names exactly", () => {
     );
   }
 
-  // The trailing segment is what a user actually types.
+  // The trailing segment is what a user actually types, and it must be worth
+  // exactly as much as the same match on an unqualified name. The token that
+  // earned the exact boost used to be scanned again for substring matches,
+  // paying a qualified name ~13% more for the same evidence.
   const lastSegment = rankingMultiplier({
     metadata: codeMetadata({ symbolName: "Foo::bar", signature: null }),
     recall: recall("bar"),
   });
-  assert.ok(lastSegment > 1.05, `${lastSegment} should treat "bar" as exact`);
+  const unqualified = rankingMultiplier({
+    metadata: codeMetadata({ symbolName: "bar", signature: null }),
+    recall: recall("bar"),
+  });
+
+  assert.equal(
+    lastSegment,
+    unqualified,
+    `Foo::bar/bar (${lastSegment}) should score the same as bar/bar (${unqualified})`,
+  );
+});
+
+test("does not pay twice for the token that earned the exact boost", () => {
+  // Neutral type so the assertion is about the position boost alone:
+  // 1 + SYMBOL_NAME_EXACT_BOOST, with no partial boost stacked on top.
+  for (const symbolName of ["bar", "Foo::bar", "foo.bar", "foo-bar"]) {
+    const multiplier = rankingMultiplier({
+      metadata: codeMetadata({
+        symbolType: "module",
+        symbolName,
+        scope: null,
+        signature: null,
+      }),
+      recall: recall("bar"),
+    });
+
+    assert.equal(
+      multiplier,
+      1.6,
+      `${symbolName} matched by "bar" should score exactly the exact-name boost`,
+    );
+  }
+});
+
+test("keeps unknown symbol types finite, including inherited property names", () => {
+  // SYMBOL_TYPE_WEIGHTS is an object literal, so a lookup for an inherited key
+  // used to return a function and turn the whole score into NaN. NaN would
+  // destabilise the fusion comparator and silently void the pruning bound.
+  for (const symbolType of [
+    "toString",
+    "constructor",
+    "__proto__",
+    "valueOf",
+    "hasOwnProperty",
+    "enum",
+    "trait",
+  ]) {
+    const multiplier = rankingMultiplier({
+      metadata: codeMetadata({
+        symbolType,
+        symbolName: "bar",
+        signature: null,
+      }),
+      recall: recall("bar"),
+    });
+
+    assert.ok(
+      Number.isFinite(multiplier),
+      `symbolType "${symbolType}" produced a non-finite multiplier: ${multiplier}`,
+    );
+    assert.ok(
+      multiplier >= 1 && multiplier <= MAX_RANKING_MULTIPLIER,
+      `symbolType "${symbolType}" produced ${multiplier}, outside [1, ${MAX_RANKING_MULTIPLIER}]`,
+    );
+    // Unknown types fall back to neutral, so only the exact-name boost applies.
+    assert.equal(
+      multiplier,
+      1.6,
+      `symbolType "${symbolType}" should be neutral`,
+    );
+  }
+});
+
+test("keeps multi-query cache keys free of collisions", () => {
+  // The cache key joins sorted queries on NUL, which the tokeniser can never
+  // emit. A plain concatenation would let ["bar","foo"] and "barfoo" share an
+  // entry, so one request's token plan would leak into another's ranking.
+  const metadata = () =>
+    codeMetadata({ symbolName: "bar", scope: "foo", signature: null });
+  const routes = (queries) =>
+    queries.map((query, index) => ({
+      path: "fts",
+      routeId: `r${index}`,
+      query,
+      found: true,
+      rank: 1,
+    }));
+
+  // Warm the cache in one order, then assert the other reading is unaffected.
+  const concatenatedFirst = rankingMultiplier({
+    metadata: metadata(),
+    recall: routes(["barfoo"]),
+  });
+  const splitSecond = rankingMultiplier({
+    metadata: metadata(),
+    recall: routes(["bar", "foo"]),
+  });
+
+  assert.notEqual(
+    concatenatedFirst,
+    splitSecond,
+    `"barfoo" and ["bar","foo"] must not share a cache entry`,
+  );
+
+  // And the reverse order yields identical values, so nothing was poisoned.
+  assert.equal(
+    rankingMultiplier({ metadata: metadata(), recall: routes(["bar", "foo"]) }),
+    splitSecond,
+  );
+  assert.equal(
+    rankingMultiplier({ metadata: metadata(), recall: routes(["barfoo"]) }),
+    concatenatedFirst,
+  );
+
+  // Different splits of the same concatenation must also stay distinct.
+  assert.notEqual(
+    rankingMultiplier({
+      metadata: metadata(),
+      recall: routes(["foo", "barbaz"]),
+    }),
+    rankingMultiplier({
+      metadata: metadata(),
+      recall: routes(["foobar", "baz"]),
+    }),
+  );
 });
 
 test("caps how many query terms are scanned", () => {

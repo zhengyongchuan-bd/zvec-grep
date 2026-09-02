@@ -36,7 +36,11 @@ import {
   resolveFileTypePatterns,
   type FileTypePatterns,
 } from "../../utils/file-selection.js";
-import { rankingMultiplier, MAX_RANKING_MULTIPLIER } from "./scoring.js";
+import {
+  rankingMultiplier,
+  rankingWeightsEnabled,
+  MAX_RANKING_MULTIPLIER,
+} from "./scoring.js";
 
 type SearchContext = {
   workspaceIndex: WorkspaceIndexInfo;
@@ -1185,20 +1189,25 @@ function fuseCandidates(
   // bound on the limit-th best final score. A candidate that cannot exceed it
   // even at the maximum multiplier keeps its unweighted score: it is ranked
   // among the tail either way, and skipping it avoids the metadata work.
-  const cutoff = weightingCutoff(pending, visibleLimit);
+  //
+  // With weighting off there is nothing to bound, so skip the cutoff sort and
+  // the weighting pass entirely and fall straight through to stock RRF order.
+  if (rankingWeightsEnabled()) {
+    const cutoff = weightingCutoff(pending, visibleLimit);
 
-  for (const candidate of pending) {
-    if (
-      candidate.score * MAX_RANKING_MULTIPLIER < cutoff &&
-      !candidate.forced
-    ) {
-      continue;
+    for (const candidate of pending) {
+      if (
+        candidate.score * MAX_RANKING_MULTIPLIER < cutoff &&
+        !candidate.forced
+      ) {
+        continue;
+      }
+
+      candidate.score *= rankingMultiplier({
+        metadata: candidate.entity.metadata,
+        recall: candidate.recall,
+      });
     }
-
-    candidate.score *= rankingMultiplier({
-      metadata: candidate.entity.metadata,
-      recall: candidate.recall,
-    });
   }
 
   const fused = pending.sort((left, right) => {

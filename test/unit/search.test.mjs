@@ -157,6 +157,69 @@ function createFixture() {
   };
 }
 
+test("limit-based weighting skips tail candidates without changing results", async () => {
+  const { context } = createFixture();
+
+  // The visible window is the contract: pruning may leave tail candidates
+  // unweighted, but everything the caller sees must be identical.
+  const limited = await searchWorkspaceIndex(
+    {
+      routes: [
+        { mode: "fts", query: "Symbol" },
+        { mode: "vector", query: "Symbol" },
+      ],
+      limit: 1,
+    },
+    context,
+  );
+  const full = await searchWorkspaceIndex(
+    {
+      routes: [
+        { mode: "fts", query: "Symbol" },
+        { mode: "vector", query: "Symbol" },
+      ],
+      limit: 99,
+    },
+    context,
+  );
+
+  assert.equal(limited.hits.length, 1);
+  assert.equal(limited.hits[0].entity.id, full.hits[0].entity.id);
+  assert.equal(limited.hits[0].score, full.hits[0].score);
+});
+
+test("tracking an entity still reports a weighted score for it", async () => {
+  const { context } = createFixture();
+
+  // Tracking must bypass pruning: the tracked entity can sit outside the
+  // window, and reporting an unweighted score for it would be misleading.
+  const tracked = await searchWorkspaceIndex(
+    {
+      routes: [
+        { mode: "fts", query: "Symbol" },
+        { mode: "vector", query: "Symbol" },
+      ],
+      limit: 1,
+      trackEntityId: "entity-c",
+    },
+    context,
+  );
+  const full = await searchWorkspaceIndex(
+    {
+      routes: [
+        { mode: "fts", query: "Symbol" },
+        { mode: "vector", query: "Symbol" },
+      ],
+      limit: 99,
+    },
+    context,
+  );
+
+  const fromFull = full.hits.find((hit) => hit.entity.id === "entity-c");
+  assert.ok(tracked.trackedHit, "tracked hit should be present");
+  assert.equal(tracked.trackedHit.score, fromFull.score);
+});
+
 test("search plan rejects malformed routes, filters, time ranges, and missing models", async () => {
   const { context } = createFixture();
   await assert.rejects(searchWorkspaceIndex({ routes: [] }, context), /route/);

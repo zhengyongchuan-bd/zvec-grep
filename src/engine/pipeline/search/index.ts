@@ -36,6 +36,7 @@ import {
   resolveFileTypePatterns,
   type FileTypePatterns,
 } from "../../utils/file-selection.js";
+import { rankingMultiplier, MAX_RANKING_MULTIPLIER } from "./scoring.js";
 
 type SearchContext = {
   workspaceIndex: WorkspaceIndexInfo;
@@ -149,7 +150,13 @@ export async function searchWorkspaceIndex(
       );
     }
 
-    const fused = timings.timeSync("fusion", () => fuseCandidates(candidates));
+    const fused = timings.timeSync("fusion", () =>
+      // Both diagnostic modes report scores for candidates outside the visible
+      // window — tracking for one specific entity, tracing for the whole
+      // ranking — so neither can tolerate the approximate tail that pruning
+      // leaves behind.
+      fuseCandidates(candidates, trace ? undefined : limit),
+    );
     const visible = fused.slice(0, limit);
     const tracked = normalized.trackEntityId
       ? fused.find((candidate) => candidate.id === normalized.trackEntityId)
@@ -1144,8 +1151,26 @@ function normalizePathFilterPattern(pattern: string): string {
   return normalizePathPattern(pattern);
 }
 
-function fuseCandidates(candidates: Map<string, Candidate>): Candidate[] {
-  for (const candidate of candidates.values()) {
+/**
+ * Fuses recall traces into a final ordering.
+ *
+ * `visibleLimit` lets scoring skip candidates that cannot reach the visible
+ * window. Omit it to score every candidate, which the diagnostic paths need
+ * because they report a score for an arbitrary tracked entity.
+ *
+ * With a limit set, only the returned window is exact. Skipped candidates keep
+ * their unweighted score, so ordering *below* the window is an approximation —
+ * two tail candidates can appear in the opposite order to a full scoring pass.
+ * That is deliberate: the tail is never shown, and scoring it costs more than
+ * the whole rest of fusion.
+ */
+function fuseCandidates(
+  candidates: Map<string, Candidate>,
+  visibleLimit?: number,
+): Candidate[] {
+  const pending = [...candidates.values()];
+
+  for (const candidate of pending) {
     candidate.score = 0;
     candidate.forced = candidate.recall.some((trace) => trace.forced);
 
@@ -1156,7 +1181,27 @@ function fuseCandidates(candidates: Map<string, Candidate>): Candidate[] {
     }
   }
 
-  const fused = [...candidates.values()].sort((left, right) => {
+  // Every multiplier is >= 1, so the limit-th best unweighted score is a lower
+  // bound on the limit-th best final score. A candidate that cannot exceed it
+  // even at the maximum multiplier keeps its unweighted score: it is ranked
+  // among the tail either way, and skipping it avoids the metadata work.
+  const cutoff = weightingCutoff(pending, visibleLimit);
+
+  for (const candidate of pending) {
+    if (
+      candidate.score * MAX_RANKING_MULTIPLIER < cutoff &&
+      !candidate.forced
+    ) {
+      continue;
+    }
+
+    candidate.score *= rankingMultiplier({
+      metadata: candidate.entity.metadata,
+      recall: candidate.recall,
+    });
+  }
+
+  const fused = pending.sort((left, right) => {
     if (right.score !== left.score) {
       return right.score - left.score;
     }
@@ -1169,6 +1214,24 @@ function fuseCandidates(candidates: Map<string, Candidate>): Candidate[] {
   }
 
   return fused;
+}
+
+/**
+ * The score a candidate must be able to reach to be worth weighting, or 0 when
+ * every candidate should be scored.
+ */
+function weightingCutoff(
+  candidates: readonly Candidate[],
+  visibleLimit: number | undefined,
+): number {
+  if (visibleLimit === undefined || candidates.length <= visibleLimit) {
+    return 0;
+  }
+
+  const scores = candidates.map((candidate) => candidate.score);
+  scores.sort((left, right) => right - left);
+
+  return scores[visibleLimit - 1] ?? 0;
 }
 
 function candidateToHit(

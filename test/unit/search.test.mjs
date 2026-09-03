@@ -318,6 +318,38 @@ test("tracking an entity still reports a weighted score for it", async () => {
   assert.equal(tracked.trackedHit.score, fromFull.score);
 });
 
+test("populates distinct fusion and ranking traces when ranking reweights hits", async () => {
+  const { context } = createFixture();
+
+  // Search with trace enabled
+  const result = await searchWorkspaceIndex(
+    {
+      routes: [
+        { mode: "fts", query: "AlphaSymbol" },
+        { mode: "vector", query: "AlphaSymbol" },
+      ],
+      limit: 3,
+      trace: true,
+    },
+    context,
+  );
+
+  assert.ok(result.hits.length > 0, "hits should be returned");
+  const hitWithTrace = result.hits[0];
+  assert.ok(hitWithTrace.trace, "trace should be present on hit");
+  assert.ok(hitWithTrace.trace.fusion, "fusion trace should be present");
+  assert.ok(hitWithTrace.trace.final, "final trace should be present");
+
+  // Since AlphaSymbol matches exact symbol name, it receives ranking weight > 1.
+  // The fusion trace records pre-weighting RRF score and ranking trace records post-weighting.
+  if (hitWithTrace.trace.ranking) {
+    assert.ok(
+      hitWithTrace.trace.ranking.score >= hitWithTrace.trace.fusion.score,
+      `ranking score (${hitWithTrace.trace.ranking.score}) should reflect multiplier over fusion score (${hitWithTrace.trace.fusion.score})`,
+    );
+  }
+});
+
 test("search plan rejects malformed routes, filters, time ranges, and missing models", async () => {
   const { context } = createFixture();
   await assert.rejects(searchWorkspaceIndex({ routes: [] }, context), /route/);

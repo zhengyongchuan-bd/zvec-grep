@@ -64,6 +64,8 @@ type Candidate = {
   score: number;
   rank: number;
   forced: boolean;
+  fusionScore?: number;
+  fusionRank?: number;
 };
 
 type InternalSearchEvidence = {
@@ -159,7 +161,7 @@ export async function searchWorkspaceIndex(
       // window — tracking for one specific entity, tracing for the whole
       // ranking — so neither can tolerate the approximate tail that pruning
       // leaves behind.
-      fuseCandidates(candidates, trace ? undefined : limit),
+      fuseCandidates(candidates, trace ? undefined : limit, trace),
     );
     const visible = fused.slice(0, limit);
     const tracked = normalized.trackEntityId
@@ -1171,6 +1173,7 @@ function normalizePathFilterPattern(pattern: string): string {
 function fuseCandidates(
   candidates: Map<string, Candidate>,
   visibleLimit?: number,
+  recordTrace: boolean = false,
 ): Candidate[] {
   const pending = [...candidates.values()];
 
@@ -1182,6 +1185,20 @@ function fuseCandidates(
       if (recall.found && recall.rank !== undefined) {
         candidate.score += 1 / (RRF_K + recall.rank);
       }
+    }
+  }
+
+  // Preserve pre-weighting stock RRF score and rank only when trace diagnostic is enabled
+  if (recordTrace) {
+    const unweightedOrder = [...pending].sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return left.id.localeCompare(right.id);
+    });
+    for (const [index, candidate] of unweightedOrder.entries()) {
+      candidate.fusionRank = index + 1;
+      candidate.fusionScore = candidate.score;
     }
   }
 
@@ -1228,19 +1245,56 @@ function fuseCandidates(
 /**
  * The score a candidate must be able to reach to be worth weighting, or 0 when
  * every candidate should be scored.
+ *
+ * For standard small visibleLimits (e.g. 7-10), maintains a min-heap / insertion
+ * window in O(N * limit) without allocating or sorting the entire candidate array.
  */
 function weightingCutoff(
   candidates: readonly Candidate[],
   visibleLimit: number | undefined,
 ): number {
-  if (visibleLimit === undefined || candidates.length <= visibleLimit) {
+  const n = candidates.length;
+  if (visibleLimit === undefined || n <= visibleLimit) {
     return 0;
   }
 
-  const scores = candidates.map((candidate) => candidate.score);
-  scores.sort((left, right) => right - left);
+  // Fallback to full sort for unusually large visible limits
+  if (visibleLimit > 32) {
+    const scores = candidates.map((candidate) => candidate.score);
+    scores.sort((left, right) => right - left);
+    return scores[visibleLimit - 1] ?? 0;
+  }
 
-  return scores[visibleLimit - 1] ?? 0;
+  const top = new Float64Array(visibleLimit);
+  for (let i = 0; i < visibleLimit; i++) {
+    top[i] = candidates[i]!.score;
+  }
+  for (let i = 0; i < visibleLimit - 1; i++) {
+    for (let j = i + 1; j < visibleLimit; j++) {
+      if (top[j]! > top[i]!) {
+        const tmp = top[i]!;
+        top[i] = top[j]!;
+        top[j] = tmp;
+      }
+    }
+  }
+
+  let minTop = top[visibleLimit - 1]!;
+
+  for (let i = visibleLimit; i < n; i++) {
+    const s = candidates[i]!.score;
+    if (s > minTop) {
+      let idx = visibleLimit - 1;
+      while (idx > 0 && top[idx - 1]! < s) {
+        top[idx] = top[idx - 1]!;
+        idx--;
+      }
+      top[idx] = s;
+      minTop = top[visibleLimit - 1]!;
+    }
+  }
+
+  return minTop;
 }
 
 function candidateToHit(
@@ -1301,13 +1355,26 @@ function candidateToTrace(candidate: Candidate, limit: number): SearchHitTrace {
     cutoffRank: limit,
   };
 
+  const hasRankingStage =
+    candidate.fusionRank !== undefined &&
+    candidate.fusionScore !== undefined &&
+    (candidate.fusionRank !== candidate.rank ||
+      candidate.fusionScore !== candidate.score);
+
   return {
     recall: candidate.recall,
     fusion: {
-      rank: candidate.rank,
-      score: candidate.score,
+      rank: candidate.fusionRank ?? candidate.rank,
+      score: candidate.fusionScore ?? candidate.score,
       forced: candidate.forced || undefined,
     },
+    ranking: hasRankingStage
+      ? {
+          rank: candidate.rank,
+          score: candidate.score,
+          forced: candidate.forced || undefined,
+        }
+      : undefined,
     final,
   };
 }

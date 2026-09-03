@@ -130,6 +130,34 @@ test("weights definition symbol types above aliases", () => {
   assert.equal(alias, 1);
 });
 
+test("does not boost short symbol names on queries that merely contain them as substrings", () => {
+  // Negative regression tests for reverse substring matching:
+  // "forget" contains "get", "dataset" contains "set", "bitmap" contains "map", etc.
+  // These must NOT earn a partial position boost for "get", "set", "map", or "log".
+  const cases = [
+    { symbolName: "get", query: "forget password" },
+    { symbolName: "get", query: "target selector" },
+    { symbolName: "set", query: "dataset migration" },
+    { symbolName: "set", query: "asset pipeline" },
+    { symbolName: "map", query: "bitmap renderer" },
+    { symbolName: "log", query: "catalog parser" },
+    { symbolName: "log", query: "prologue chapter" },
+  ];
+
+  for (const { symbolName, query } of cases) {
+    const multiplier = rankingMultiplier({
+      metadata: codeMetadata({ symbolName, signature: null, scope: null }),
+      recall: recall(query),
+    });
+
+    assert.equal(
+      multiplier,
+      1.2,
+      `symbolName "${symbolName}" with query "${query}" earned an unexpected partial boost: ${multiplier}`,
+    );
+  }
+});
+
 test("does not boost one- and two-character symbol names on unrelated queries", () => {
   // "a" is a substring of almost any query, so reverse containment would
   // otherwise hand a near-maximum boost to a completely unrelated symbol.
@@ -966,3 +994,56 @@ test("is case-insensitive on symbol names", () => {
 
   assert.equal(lower, exact);
 });
+
+test("models relative promotion of code entities over markdown docs without structural match", () => {
+  // Verifies the deliberate code-first prior contract in mixed corpora:
+  // An unweighted markdown doc at stock rank 1 has score 1/(60+1) ≈ 0.016393.
+  // An unrelated code function (no name/scope/sig match, metadata fields absent)
+  // at stock rank 13 has score (1/(60+13)) * 1.2 ≈ 0.016438.
+  // With type prior alone, the function can overtake rank 13 -> passing rank 1.
+  // However, an unrelated function at rank 14 (score 1.2/74 ≈ 0.016216) cannot.
+  const query = "how to configure database connections";
+  const docCandidate = {
+    metadata: { kind: "markdown", heading: "Configuration Guide", level: 1, scope: null },
+    recall: recall(query, { rank: 1 }),
+  };
+  const codeCandidate13 = {
+    metadata: codeMetadata({
+      symbolType: "function",
+      symbolName: null,
+      scope: null,
+      signature: null,
+    }),
+    recall: recall(query, { rank: 13 }),
+  };
+  const codeCandidate14 = {
+    metadata: codeMetadata({
+      symbolType: "function",
+      symbolName: null,
+      scope: null,
+      signature: null,
+    }),
+    recall: recall(query, { rank: 14 }),
+  };
+
+  const docMultiplier = rankingMultiplier(docCandidate);
+  const codeMultiplier13 = rankingMultiplier(codeCandidate13);
+  const codeMultiplier14 = rankingMultiplier(codeCandidate14);
+
+  assert.equal(docMultiplier, 1.0, "markdown doc receives neutral multiplier 1.0");
+  assert.equal(codeMultiplier13, 1.2, "function receives type weight 1.20 even without structural match");
+
+  const docScore = (1 / (60 + 1)) * docMultiplier;
+  const codeScore13 = (1 / (60 + 13)) * codeMultiplier13;
+  const codeScore14 = (1 / (60 + 14)) * codeMultiplier14;
+
+  assert.ok(
+    codeScore13 > docScore,
+    `unrelated function at rank 13 (${codeScore13.toFixed(6)}) should overtake rank 1 doc (${docScore.toFixed(6)}) by type prior`,
+  );
+  assert.ok(
+    codeScore14 < docScore,
+    `unrelated function at rank 14 (${codeScore14.toFixed(6)}) cannot overtake rank 1 doc (${docScore.toFixed(6)})`,
+  );
+});
+

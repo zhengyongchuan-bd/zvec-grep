@@ -607,20 +607,16 @@ function substringMatchCategory(
 }
 
 /**
- * Substring containment in either direction.
+ * Checks whether a query token is contained as a substring within a metadata
+ * field (symbol name, enclosing scope, or signature).
  *
- * Tokens reaching here already passed the length and stop-word filters when the
- * TokenPlan was built, so this only guards the reverse direction: a very short
- * symbol name would otherwise be "contained" in nearly every query term.
+ * Strict forward containment only (field.includes(token)). Reverse containment
+ * (token.includes(field)) is deliberately barred: otherwise common short symbol
+ * names ("get", "set", "map", "log") would spuriously match queries like
+ * "forget password", "dataset migration", "bitmap renderer", and "catalog parser".
  */
-function isSubstringMatch(haystack: string, token: string): boolean {
-  if (haystack.includes(token)) {
-    return true;
-  }
-
-  return (
-    haystack.length >= MIN_SUBSTRING_TOKEN_LENGTH && token.includes(haystack)
-  );
+function isSubstringMatch(field: string, token: string): boolean {
+  return field.includes(token);
 }
 
 function symbolTypeWeight(symbolType: CodeSymbolType): number {

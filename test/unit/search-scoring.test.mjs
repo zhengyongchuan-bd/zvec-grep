@@ -521,7 +521,7 @@ test("does not pay twice for the token that earned the exact boost", () => {
 
     assert.equal(
       multiplier,
-      1.6,
+      1.65,
       `${symbolName} matched by "bar" should score exactly the exact-name boost`,
     );
   }
@@ -560,7 +560,7 @@ test("keeps unknown symbol types finite, including inherited property names", ()
     // Unknown types fall back to neutral, so only the exact-name boost applies.
     assert.equal(
       multiplier,
-      1.6,
+      1.65,
       `symbolType "${symbolType}" should be neutral`,
     );
   }

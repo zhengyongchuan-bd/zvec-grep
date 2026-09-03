@@ -32,10 +32,10 @@ import type {
  */
 
 /** Query token matched the symbol name exactly (case-insensitive). */
-const SYMBOL_NAME_EXACT_BOOST = 0.6;
+const SYMBOL_NAME_EXACT_BOOST = 0.65;
 
 /** Query token is a substring of the symbol name. */
-const SYMBOL_NAME_PARTIAL_BOOST = 0.36;
+const SYMBOL_NAME_PARTIAL_BOOST = 0.29;
 
 /** Query token matched the enclosing scope (class/module the symbol lives in). */
 const SCOPE_MATCH_BOOST = 0.28;
@@ -51,7 +51,7 @@ const SIGNATURE_MATCH_BOOST = 0.08;
  * out-score a genuine symbol-name hit. Secondary matches are therefore
  * discounted, and the total is capped below.
  */
-const SECONDARY_MATCH_WEIGHT = 0.65;
+const SECONDARY_MATCH_WEIGHT = 0.75;
 
 /**
  * Ceiling on the summed position boost.
@@ -171,8 +171,8 @@ const STOP_WORDS: ReadonlySet<string> = new Set([
  * slightly above incidental matches; nothing is demoted below neutral.
  */
 const SYMBOL_TYPE_WEIGHTS: Readonly<Record<CodeSymbolType, number>> = {
-  function: 1.2,
-  class: 1.12,
+  function: 1.3,
+  class: 1.25,
   interface: 1.05,
   module: 1.0,
   value: 1.0,

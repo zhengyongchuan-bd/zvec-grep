@@ -277,17 +277,24 @@ export function rankingMultiplier(candidate: CandidateScoreInput): number {
 
   const typeWeight = symbolTypeWeight(metadata.symbolType);
 
-  // Nothing to match against: skip tokenising and return the type weight alone.
-  // Fields may be absent rather than null when metadata predates a schema change.
+  // If metadata fields are missing, no position match is possible.
   if (
     metadata.symbolName == null &&
     metadata.scope == null &&
     metadata.signature == null
   ) {
-    return typeWeight;
+    return NEUTRAL_WEIGHT;
   }
 
-  return positionBoost(metadata, queryTokens(candidate.recall)) * typeWeight;
+  const boost = positionBoost(metadata, queryTokens(candidate.recall));
+  // Condition symbol-type prior on having at least one structural match:
+  // An unanchored code function should not arbitrarily displace relevant docs
+  // or closer semantic matches purely by virtue of being a function.
+  if (boost === NEUTRAL_WEIGHT) {
+    return NEUTRAL_WEIGHT;
+  }
+
+  return boost * typeWeight;
 }
 
 /**
@@ -362,18 +369,31 @@ const tokenPlanCache = new Map<string, TokenPlan>();
 /** Bounds the memo so a long-lived daemon cannot accumulate queries forever. */
 const TOKEN_PLAN_CACHE_LIMIT = 512;
 
+/** Cap on query string length allowed into the token plan cache to guard memory. */
+const MAX_CACHED_QUERY_LENGTH = 4096;
+
 function tokenPlanForQuery(query: string): TokenPlan {
-  return tokenPlanCache.get(query) ?? rememberTokenPlan(query, [query]);
+  if (query.length > MAX_CACHED_QUERY_LENGTH) {
+    return rememberTokenPlan(query, [query], false);
+  }
+  return tokenPlanCache.get(query) ?? rememberTokenPlan(query, [query], true);
 }
 
 function tokenPlanForQueries(
   key: string,
   queries: readonly string[],
 ): TokenPlan {
-  return tokenPlanCache.get(key) ?? rememberTokenPlan(key, queries);
+  if (key.length > MAX_CACHED_QUERY_LENGTH) {
+    return rememberTokenPlan(key, queries, false);
+  }
+  return tokenPlanCache.get(key) ?? rememberTokenPlan(key, queries, true);
 }
 
-function rememberTokenPlan(key: string, queries: readonly string[]): TokenPlan {
+function rememberTokenPlan(
+  key: string,
+  queries: readonly string[],
+  shouldCache: boolean = true,
+): TokenPlan {
   const all = new Set<string>();
   for (const query of queries) {
     for (const token of tokenizeQuery(query)) {
@@ -396,10 +416,12 @@ function rememberTokenPlan(key: string, queries: readonly string[]): TokenPlan {
   }
 
   const plan: TokenPlan = { all, substring };
-  if (tokenPlanCache.size >= TOKEN_PLAN_CACHE_LIMIT) {
-    tokenPlanCache.clear();
+  if (shouldCache) {
+    if (tokenPlanCache.size >= TOKEN_PLAN_CACHE_LIMIT) {
+      tokenPlanCache.clear();
+    }
+    tokenPlanCache.set(key, plan);
   }
-  tokenPlanCache.set(key, plan);
 
   return plan;
 }
@@ -410,6 +432,14 @@ const queryTokenCache = new Map<string, readonly string[]>();
 const QUERY_TOKEN_CACHE_LIMIT = 512;
 
 function tokenizeQuery(query: string): readonly string[] {
+  if (query.length > MAX_CACHED_QUERY_LENGTH) {
+    const tokens: string[] = [];
+    for (const match of query.matchAll(IDENTIFIER_PATTERN)) {
+      tokens.push(match[0].toLowerCase());
+    }
+    return tokens;
+  }
+
   const cached = queryTokenCache.get(query);
   if (cached !== undefined) {
     return cached;
